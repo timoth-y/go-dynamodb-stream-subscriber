@@ -6,18 +6,16 @@ package main
 
 import (
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
-	"github.com/urakozz/go-dynamodb-stream-subscriber/stream"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
+	"github.com/timoth-y/go-dynamodb-stream-subscriber/stream"
 )
 
 func main() {
 	cfg := aws.NewConfig().WithRegion("eu-west-1")
-	sess := session.New()
-	streamSvc := dynamodbstreams.New(sess, cfg)
-	dynamoSvc := dynamodb.New(sess, cfg)
+	streamSvc := dynamodbstreams.New(cfg)
+	dynamoSvc := dynamodb.New(cfg)
 	table := "tableName"
 
 	streamSubscriber := stream.NewStreamSubscriber(dynamoSvc, streamSvc, table)
