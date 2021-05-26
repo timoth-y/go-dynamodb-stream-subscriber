@@ -1,58 +1,43 @@
-// Yury Kozyrev (urakozz)
-// MIT License
 package stream
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"time"
 
-	"sync"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
-	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
-	"github.com/aws/aws-sdk-go/service/dynamodbstreams/dynamodbstreamsiface"
+	"github.com/aws/aws-sdk-go-v2/aws/awserr"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 )
 
-type StreamSubscriber struct {
-	dynamoSvc         dynamodbiface.DynamoDBAPI
-	streamSvc         dynamodbstreamsiface.DynamoDBStreamsAPI
+type Subscriber struct {
+	dynamoSvc         *dynamodb.Client
+	streamSvc         *dynamodbstreams.Client
 	table             *string
-	ShardIteratorType *string
+	ShardIteratorType dynamodbstreams.ShardIteratorType
 	Limit             *int64
 }
 
 func NewStreamSubscriber(
-	dynamoSvc dynamodbiface.DynamoDBAPI,
-	streamSvc dynamodbstreamsiface.DynamoDBStreamsAPI,
-	table string) *StreamSubscriber {
-	s := &StreamSubscriber{dynamoSvc: dynamoSvc, streamSvc: streamSvc, table: &table}
-	s.applyDefaults()
-	return s
-}
-
-func (r *StreamSubscriber) applyDefaults() {
-	if r.ShardIteratorType == nil {
-		r.ShardIteratorType = aws.String(dynamodbstreams.ShardIteratorTypeLatest)
+	dynamoSvc *dynamodb.Client,
+	streamSvc *dynamodbstreams.Client,
+	table string,
+) *Subscriber {
+	return &Subscriber{
+		dynamoSvc: dynamoSvc,
+		streamSvc: streamSvc,
+		table: &table,
+		ShardIteratorType: dynamodbstreams.ShardIteratorTypeLatest,
 	}
 }
 
-func (r *StreamSubscriber) SetLimit(v int64) {
-	r.Limit = aws.Int64(v)
-}
+func (r *Subscriber) GetStreamData() (<-chan dynamodbstreams.Record, <-chan error) {
 
-func (r *StreamSubscriber) SetShardIteratorType(s string) {
-	r.ShardIteratorType = aws.String(s)
-}
-
-func (r *StreamSubscriber) GetStreamData() (<-chan *dynamodbstreams.Record, <-chan error) {
-
-	ch := make(chan *dynamodbstreams.Record, 1)
+	ch := make(chan dynamodbstreams.Record, 1)
 	errCh := make(chan error, 1)
 
-	go func(ch chan<- *dynamodbstreams.Record, errCh chan<- error) {
+	go func(ch chan<- dynamodbstreams.Record, errCh chan<- error) {
 		var shardId *string
 		var prevShardId *string
 		var streamArn *string
@@ -82,9 +67,8 @@ func (r *StreamSubscriber) GetStreamData() (<-chan *dynamodbstreams.Record, <-ch
 	return ch, errCh
 }
 
-func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record, <-chan error) {
-
-	ch := make(chan *dynamodbstreams.Record, 1)
+func (r *Subscriber) GetStreamDataAsync() (<-chan dynamodbstreams.Record, <-chan error) {
+	ch := make(chan dynamodbstreams.Record, 1)
 	errCh := make(chan error, 1)
 
 	needUpdateChannel := make(chan struct{}, 1)
@@ -148,7 +132,7 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 				if err != nil {
 					errCh <- err
 				}
-				// TODO: think about cleaning list of shards: delete(allShards, *sInput.ShardId)
+
 				<-limit
 			}(shardInput)
 		}
@@ -156,10 +140,10 @@ func (r *StreamSubscriber) GetStreamDataAsync() (<-chan *dynamodbstreams.Record,
 	return ch, errCh
 }
 
-func (r *StreamSubscriber) getShardIds(streamArn *string) (ids []*dynamodbstreams.Shard, err error) {
-	des, err := r.streamSvc.DescribeStream(&dynamodbstreams.DescribeStreamInput{
+func (r *Subscriber) getShardIds(streamArn *string) (ids []dynamodbstreams.Shard, err error) {
+	des, err := r.streamSvc.DescribeStreamRequest(&dynamodbstreams.DescribeStreamInput{
 		StreamArn: streamArn,
-	})
+	}).Send(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -171,14 +155,14 @@ func (r *StreamSubscriber) getShardIds(streamArn *string) (ids []*dynamodbstream
 	return des.StreamDescription.Shards, nil
 }
 
-func (r *StreamSubscriber) findProperShardId(previousShardId *string) (shadrId *string, streamArn *string, err error) {
+func (r *Subscriber) findProperShardId(previousShardId *string) (shadrId *string, streamArn *string, err error) {
 	streamArn, err = r.getLatestStreamArn()
 	if err != nil {
 		return nil, nil, err
 	}
-	des, err := r.streamSvc.DescribeStream(&dynamodbstreams.DescribeStreamInput{
+	des, err := r.streamSvc.DescribeStreamRequest(&dynamodbstreams.DescribeStreamInput{
 		StreamArn: streamArn,
-	})
+	}).Send(context.Background())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -202,18 +186,23 @@ func (r *StreamSubscriber) findProperShardId(previousShardId *string) (shadrId *
 	return
 }
 
-func (r *StreamSubscriber) getLatestStreamArn() (*string, error) {
-	tableInfo, err := r.dynamoSvc.DescribeTable(&dynamodb.DescribeTableInput{TableName: r.table})
+func (r *Subscriber) getLatestStreamArn() (*string, error) {
+	tableInfo, err := r.dynamoSvc.DescribeTableRequest(
+		&dynamodb.DescribeTableInput{TableName: r.table},
+	).Send(context.Background())
+
 	if err != nil {
 		return nil, err
 	}
+
 	if nil == tableInfo.Table.LatestStreamArn {
 		return nil, errors.New("empty table stream arn")
 	}
+
 	return tableInfo.Table.LatestStreamArn, nil
 }
 
-func (r *StreamSubscriber) processShardBackport(shardId, lastStreamArn *string, ch chan<- *dynamodbstreams.Record) error {
+func (r *Subscriber) processShardBackport(shardId, lastStreamArn *string, ch chan<- dynamodbstreams.Record) error {
 	return r.processShard(&dynamodbstreams.GetShardIteratorInput{
 		StreamArn:         lastStreamArn,
 		ShardId:           shardId,
@@ -221,11 +210,12 @@ func (r *StreamSubscriber) processShardBackport(shardId, lastStreamArn *string, 
 	}, ch)
 }
 
-func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorInput, ch chan<- *dynamodbstreams.Record) error {
-	iter, err := r.streamSvc.GetShardIterator(input)
+func (r *Subscriber) processShard(input *dynamodbstreams.GetShardIteratorInput, ch chan<- dynamodbstreams.Record) error {
+	iter, err := r.streamSvc.GetShardIteratorRequest(input).Send(context.Background())
 	if err != nil {
 		return err
 	}
+
 	if iter.ShardIterator == nil {
 		return nil
 	}
@@ -233,13 +223,11 @@ func (r *StreamSubscriber) processShard(input *dynamodbstreams.GetShardIteratorI
 	nextIterator := iter.ShardIterator
 
 	for nextIterator != nil {
-		recs, err := r.streamSvc.GetRecords(&dynamodbstreams.GetRecordsInput{
+		recs, err := r.streamSvc.GetRecordsRequest(&dynamodbstreams.GetRecordsInput{
 			ShardIterator: nextIterator,
 			Limit:         r.Limit,
-		})
+		}).Send(context.Background())
 		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "TrimmedDataAccessException" {
-			//Trying to request data older than 24h, that's ok
-			//http://docs.aws.amazon.com/dynamodbstreams/latest/APIReference/API_GetShardIterator.html -> Errors
 			return nil
 		}
 		if err != nil {
